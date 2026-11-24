@@ -7,6 +7,7 @@ namespace SilverStripe\WebAuthn;
 use CBOR\Decoder;
 use Cose\Algorithm\Manager;
 use Exception;
+use TypeError;
 use GuzzleHttp\Psr7\ServerRequest;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Serializer\Normalizer\AbstractObjectNormalizer;
@@ -127,7 +128,8 @@ class VerifyHandler implements VerifyHandlerInterface
                 );
             # webauthn-lib 4 saved the updated signature counter to the repository itself; webauthn-lib 5 returns it
             $credentialRepository->saveCredentialSource($updatedRecord);
-        } catch (Exception $e) {
+        # webauthn-lib 5's strict denormalizers throw TypeError on badly typed input: a failed result, as with 4.x
+        } catch (Exception | TypeError $e) {
             $this->logger->error($e->getMessage());
             return Result::create(false, 'Verification failed: ' . $e->getMessage());
         }
@@ -137,6 +139,7 @@ class VerifyHandler implements VerifyHandlerInterface
 
     /**
      * Make authenticatorData Base64urlSafe which is expected by PublicKeyCredentialLoader::createResponse()
+     * (webauthn-lib 4; in webauthn-lib 5 by AuthenticatorAssertionResponseDenormalizer)
      *
      * webauthn-lib 5 (AuthenticatorAssertionResponseDenormalizer) also requires base64url for signature, userHandle
      * and clientDataJSON, while the client (client/src/lib/convert.js byteArrayToBase64()) sends standard base64.
