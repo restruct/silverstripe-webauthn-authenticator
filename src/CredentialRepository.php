@@ -202,9 +202,10 @@ class CredentialRepository
     /**
      * The webauthn-lib 5 normalised form of a credential, in the JSON shape webauthn-lib 4 wrote.
      *
-     * webauthn-lib 5 writes the trust path without its "type" key, which webauthn-lib 4 needs to read it back. The key
-     * is added again, so data written after an upgrade still loads if a site has to roll back. webauthn-lib 5 reads
-     * both forms (TrustPathDenormalizer).
+     * webauthn-lib 5 writes the trust path without its "type" key. webauthn-lib 4.4 to 4.8 need that key to read it
+     * back (TrustPathLoader: "The trust path type is missing"); 4.9 reads both forms. 4.4.3 is what projects fall
+     * back to when Composer blocks 4.9.x for its advisories. The key is added again, so data written after an upgrade
+     * still loads if a site has to roll back. webauthn-lib 5 reads both forms (TrustPathDenormalizer).
      *
      * @param CredentialRecord $source
      * @return array
