@@ -64,6 +64,60 @@ class StoredCredentialTest extends SapphireTest
         $this->assertTrue($result->isSuccessful(), 'Second login, higher counter: ' . $result->getMessage());
     }
 
+    /**
+     * restruct/silverstripe-mfa-bundle sets authenticator_attachment to null (allow platform and cross-platform keys);
+     * webauthn-lib 5 rejects an empty string there, so null must reach it as null.
+     */
+    #[DataProvider('formatProvider')]
+    public function testRegisterThenVerifyWithoutAttachmentPreference(string $format): void
+    {
+        RegisterHandler::config()->set('authenticator_attachment', null);
+        $member = $this->createMember();
+        $key = new SoftwareAuthenticator();
+        $data = $this->register($member, $key, $format);
+
+        $result = $this->verify($member, $data, $key);
+        $this->assertTrue($result->isSuccessful(), 'Login: ' . $result->getMessage());
+    }
+
+    /**
+     * Badly typed fields make webauthn-lib 5's strict denormalizers throw a TypeError (not an Exception). With
+     * webauthn-lib 4 that was a failed result; it must stay one rather than becoming an uncaught error.
+     */
+    public function testBadlyTypedInputGivesFailedResult(): void
+    {
+        $member = $this->createMember();
+        $key = new SoftwareAuthenticator();
+
+        // registration: transports must be a list
+        $handler = Injector::inst()->create(RegisterHandler::class);
+        $store = new SessionStore($member);
+        $keyData = json_decode(json_encode($handler->start($store)), true)['keyData'];
+        $credential = json_decode(base64_decode(
+            $key->createCredential($keyData, self::ORIGIN, SoftwareAuthenticator::FORMAT_NONE)
+        ), true);
+        $credential['response']['transports'] = 'usb';
+        $request = new HTTPRequest('POST', '/', [], [], json_encode(['credentials' => base64_encode(json_encode(
+            $credential
+        ))]));
+        $this->assertFalse($handler->register($request, $store)->isSuccessful());
+
+        // login: userHandle must be a string
+        $data = $this->register($member, $key, SoftwareAuthenticator::FORMAT_NONE);
+        $method = RegisteredMethod::create(['Data' => $data, 'MemberID' => $member->ID]);
+        $handler = Injector::inst()->create(VerifyHandler::class);
+        $store = new SessionStore($member);
+        $publicKey = json_decode(json_encode($handler->start($store, $method)), true)['publicKey'];
+        $assertion = json_decode(base64_decode(
+            $key->getAssertion($publicKey, self::ORIGIN, self::HOST, (string) $member->ID)
+        ), true);
+        $assertion['response']['userHandle'] = 123;
+        $request = new HTTPRequest('POST', '/', [], [], json_encode(['credentials' => base64_encode(json_encode(
+            $assertion
+        ))]));
+        $this->assertFalse($handler->verify($request, $store, $method)->isSuccessful());
+    }
+
     #[DataProvider('formatProvider')]
     public function testVerifyFailsWithWrongKey(string $format): void
     {

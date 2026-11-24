@@ -6,6 +6,7 @@ namespace SilverStripe\WebAuthn;
 
 use Cose\Algorithms;
 use Exception;
+use TypeError;
 use GuzzleHttp\Psr7\ServerRequest;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Serializer\Normalizer\AbstractObjectNormalizer;
@@ -141,12 +142,14 @@ class RegisterHandler implements RegisterHandlerInterface
                 ->getAuthenticatorAttestationResponseValidator($attestationStatementSupportManager, $store)
                 ->check($response, $options, $psrRequest->getUri()->getHost());
 
-            # webauthn-lib 4 refused a credential ID the repository already held; webauthn-lib 5 leaves that to the
-            # application (https://www.w3.org/TR/webauthn-3/#reg-ceremony-verify-credential-id)
+            # webauthn-lib 4.4 refused a credential ID the repository already held (4.9 had dropped that check);
+            # webauthn-lib 5 leaves it to the application
+            # (https://www.w3.org/TR/webauthn-3/#reg-ceremony-verify-credential-id)
             if ($this->getCredentialRepository($store)->has($publicKeyCredentialSource->publicKeyCredentialId)) {
                 throw new ResponseDataException('The credential ID is already registered');
             }
-        } catch (Exception $e) {
+        # webauthn-lib 5's strict denormalizers throw TypeError on badly typed input: a failed result, as with 4.x
+        } catch (Exception | TypeError $e) {
             $this->logger->error($e->getMessage());
             return Result::create(false, 'Registration failed: ' . $e->getMessage());
         }
@@ -289,8 +292,10 @@ class RegisterHandler implements RegisterHandlerInterface
      */
     protected function getAuthenticatorSelectionCriteria(): AuthenticatorSelectionCriteria
     {
+        # null (no preference, e.g. set by restruct/silverstripe-mfa-bundle) must stay null: webauthn-lib 5 only accepts
+        # null, 'platform' or 'cross-platform' and throws on the empty string a (string) cast would give
         return AuthenticatorSelectionCriteria::create(
-            authenticatorAttachment: (string) $this->config()->get('authenticator_attachment')
+            authenticatorAttachment: $this->config()->get('authenticator_attachment') ?: null
         );
     }
 }
