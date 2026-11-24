@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace SilverStripe\WebAuthn\Tests;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use SilverStripe\Control\Director;
 use SilverStripe\Control\HTTPRequest;
 use SilverStripe\Core\Environment;
@@ -42,7 +43,7 @@ class StoredCredentialTest extends SapphireTest
         $_SERVER['SERVER_PORT'] = 443;
     }
 
-    public function formatProvider(): array
+    public static function formatProvider(): array
     {
         return [
             'none' => [SoftwareAuthenticator::FORMAT_NONE],
@@ -50,9 +51,7 @@ class StoredCredentialTest extends SapphireTest
         ];
     }
 
-    /**
-     * @dataProvider formatProvider
-     */
+    #[DataProvider('formatProvider')]
     public function testRegisterThenVerify(string $format): void
     {
         $member = $this->createMember();
@@ -65,9 +64,7 @@ class StoredCredentialTest extends SapphireTest
         $this->assertTrue($result->isSuccessful(), 'Second login, higher counter: ' . $result->getMessage());
     }
 
-    /**
-     * @dataProvider formatProvider
-     */
+    #[DataProvider('formatProvider')]
     public function testVerifyFailsWithWrongKey(string $format): void
     {
         $member = $this->createMember();
@@ -83,9 +80,8 @@ class StoredCredentialTest extends SapphireTest
 
     /**
      * A registration stored by an earlier webauthn-lib version (see fixtures/README.md) must still verify.
-     *
-     * @dataProvider formatProvider
      */
+    #[DataProvider('formatProvider')]
     public function testStoredFixtureVerifies(string $format): void
     {
         $fixture = json_decode(
