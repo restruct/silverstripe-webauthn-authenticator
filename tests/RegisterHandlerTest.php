@@ -13,7 +13,10 @@ use SilverStripe\MFA\Store\SessionStore;
 use SilverStripe\Security\Member;
 use SilverStripe\WebAuthn\CredentialRepository;
 use SilverStripe\WebAuthn\RegisterHandler;
+use Symfony\Component\Serializer\SerializerInterface;
+use Symfony\Component\Uid\Uuid;
 use Webauthn\AttestationStatement\AttestationObject;
+use Webauthn\AttestationStatement\AttestationStatement;
 use Webauthn\AttestedCredentialData;
 use Webauthn\AuthenticatorAssertionResponse;
 use Webauthn\AuthenticatorAttestationResponse;
@@ -21,10 +24,9 @@ use Webauthn\AuthenticatorAttestationResponseValidator;
 use Webauthn\AuthenticatorData;
 use Webauthn\AuthenticatorResponse;
 use Webauthn\AuthenticatorSelectionCriteria;
+use Webauthn\CollectedClientData;
+use Webauthn\CredentialRecord;
 use Webauthn\PublicKeyCredential;
-use Webauthn\PublicKeyCredentialCreationOptions;
-use Webauthn\PublicKeyCredentialLoader;
-use Webauthn\PublicKeyCredentialSource;
 use Webauthn\TrustPath\EmptyTrustPath;
 
 class RegisterHandlerTest extends SapphireTest
@@ -97,14 +99,12 @@ class RegisterHandlerTest extends SapphireTest
         $result = $this->handler->start($this->store);
         $this->assertArrayHasKey('keyData', $result);
 
-        /** @var PublicKeyCredentialCreationOptions $options */
+        // webauthn-lib 5: start() returns the options in the JSON form the browser receives
         $options = $result['keyData'];
-        $this->assertInstanceOf(PublicKeyCredentialCreationOptions::class, $options);
-
-        $relyingPartyEntity = $options->getRp();
+        $this->assertIsArray($options);
         $this->assertSame(
             $expected,
-            $relyingPartyEntity->getId(),
+            $options['rp']['id'] ?? null,
             'Relying party entity should identify the current SilverStripe domain'
         );
     }
@@ -132,14 +132,12 @@ class RegisterHandlerTest extends SapphireTest
         $result = $this->handler->start($this->store);
         $this->assertArrayHasKey('keyData', $result);
 
-        /** @var PublicKeyCredentialCreationOptions $options */
+        // webauthn-lib 5: start() returns the options in the JSON form the browser receives
         $options = $result['keyData'];
-        $this->assertInstanceOf(PublicKeyCredentialCreationOptions::class, $options);
-
-        $authenticatorSelection = $options->getAuthenticatorSelection();
+        $this->assertIsArray($options);
         $this->assertSame(
             AuthenticatorSelectionCriteria::AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
-            $authenticatorSelection->getAuthenticatorAttachment()
+            $options['authenticatorSelection']['authenticatorAttachment']
         );
     }
 
@@ -148,9 +146,10 @@ class RegisterHandlerTest extends SapphireTest
         $result = $this->handler->start($this->store);
         $this->assertArrayHasKey('keyData', $result);
 
-        /** @var PublicKeyCredentialCreationOptions $options */
+        // webauthn-lib 5: start() returns the options in the JSON form the browser receives
         $options = $result['keyData'];
-        $this->assertInstanceOf(PublicKeyCredentialCreationOptions::class, $options);
+        $this->assertIsArray($options);
+        $this->assertArrayHasKey('challenge', $options);
     }
 
     public function testRegisterReturnsErrorWhenRequiredInformationIsMissing()
@@ -178,12 +177,12 @@ class RegisterHandlerTest extends SapphireTest
     ) {
         /** @var RegisterHandler&MockObject $handlerMock */
         $handlerMock = $this->getMockBuilder(RegisterHandler::class)
-            ->setMethods(['getPublicKeyCredentialLoader', 'getAuthenticatorAttestationResponseValidator'])
+            ->setMethods(['getSerializer', 'getAuthenticatorAttestationResponseValidator'])
             ->getMock();
 
-        $publicKeyCredentialSourceMock = $this->createMock(PublicKeyCredentialSource::class);
+        // webauthn-lib 5: check() returns a CredentialRecord, which register() now uses (duplicate ID check)
         $responseValidatorMock = $this->createMock(AuthenticatorAttestationResponseValidator::class);
-        $responseValidatorMock->method('check')->willReturn($publicKeyCredentialSourceMock);
+        $responseValidatorMock->method('check')->willReturn(static::createTestRecord('publicKeyCredentialId'));
 
         // Allow the data provider to customise the validation check handling
         if ($responseValidatorMockCallback) {
@@ -195,15 +194,13 @@ class RegisterHandlerTest extends SapphireTest
         $loggerMock = $this->createMock(LoggerInterface::class);
         $handlerMock->setLogger($loggerMock);
 
-        $loaderMock = $this->createMock(PublicKeyCredentialLoader::class);
-        $handlerMock->expects($this->once())->method('getPublicKeyCredentialLoader')->willReturn($loaderMock);
-
-        $publicKeyCredentialMock = $this->createMock(PublicKeyCredential::class);
-        $loaderMock->expects($this->once())->method('load')->with('example')->willReturn(
-            $publicKeyCredentialMock
-        );
-
-        $publicKeyCredentialMock->expects($this->any())->method('getResponse')->willReturn($mockResponse);
+        // webauthn-lib 5 reads the credential through a serializer (PublicKeyCredentialLoader is gone), and
+        // PublicKeyCredential exposes its response as a property, so a real one carries the mock response
+        $serializerMock = $this->createMock(SerializerInterface::class);
+        $handlerMock->expects($this->once())->method('getSerializer')->willReturn($serializerMock);
+        $serializerMock->expects($this->once())->method('deserialize')
+            ->with('example', PublicKeyCredential::class, 'json')
+            ->willReturn(PublicKeyCredential::create('public-key', 'publicKeyCredentialId', $mockResponse));
 
         $this->request->setBody(json_encode([
             'credentials' => base64_encode('example'),
@@ -235,40 +232,25 @@ class RegisterHandlerTest extends SapphireTest
      */
     public function registerProvider()
     {
-        // phpcs:disable
-        $testSource = PublicKeyCredentialSource::createFromArray([
-            'publicKeyCredentialId' => 'cHVibGljS2V5Q3JlZGVudGlhbElk',
-            'type' => 'public-key',
-            'transports' =>
-                array (
-                ),
-            'attestationType' => 'none',
-            'trustPath' =>
-                array (
-                    'type' => EmptyTrustPath::class,
-                ),
-            'aaguid' => 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA',
-            'credentialPublicKey' => 'cHVibGljS2V5',
-            'userHandle' => 'dXNlckhhbmRsZQ',
-            'counter' => 123456789,
-        ]);
-        // phpcs:enable
+        // The test credential (formerly PublicKeyCredentialSource::createFromArray(), see createTestRecord())
+        $testSource = static::createTestRecord('publicKeyCredentialId');
 
         $authDataMock = $this->createMock(AuthenticatorData::class);
-        $authDataMock->expects($this->exactly(4))->method('hasAttestedCredentialData')
+        $authDataMock->expects($this->exactly(5))->method('hasAttestedCredentialData')
             // The first call is the "response indicates incomplete data" test case, second is "valid response",
-            // third is "invalid response"
-            ->willReturnOnConsecutiveCalls(false, true, true, true);
-        $authDataMock->expects($this->any())->method('getAttestedCredentialData')->willReturn(
-            $testSource->getAttestedCredentialData()
+            // third is "valid response with existing credential", fourth is "response for an already registered
+            // credential", fifth is "invalid response"
+            ->willReturnOnConsecutiveCalls(false, true, true, true, true);
+        // webauthn-lib 5 has no getAttestedCredentialData()/getSignCount() on AuthenticatorData (they are properties
+        // now), and register() does not read them, so they are not stubbed any more
+
+        // webauthn-lib 5 reads attestationObject and authData as properties, which a mock cannot provide: real
+        // objects carry the mocked AuthenticatorData instead
+        $attestationMock = AttestationObject::create('', $this->createMock(AttestationStatement::class), $authDataMock);
+        $responseMock = AuthenticatorAttestationResponse::create(
+            $this->createMock(CollectedClientData::class),
+            $attestationMock
         );
-        $authDataMock->expects($this->any())->method('getSignCount')->willReturn(1);
-
-        $attestationMock = $this->createMock(AttestationObject::class);
-        $attestationMock->expects($this->any())->method('getAuthData')->willReturn($authDataMock);
-
-        $responseMock = $this->createMock(AuthenticatorAttestationResponse::class);
-        $responseMock->expects($this->any())->method('getAttestationObject')->willReturn($attestationMock);
 
         return [
             'wrong response return type' => [
@@ -291,9 +273,7 @@ class RegisterHandlerTest extends SapphireTest
                     $responseValidatorMock
                         ->expects($this->once())
                         ->method('check')
-                        ->willReturnCallback(function (): bool {
-                            return true;
-                        });
+                        ->willReturn(static::createTestRecord('publicKeyCredentialId'));
                 },
             ],
             'valid response with existing credential' => [
@@ -305,30 +285,30 @@ class RegisterHandlerTest extends SapphireTest
                     $responseValidatorMock
                         ->expects($this->once())
                         ->method('check')
-                        ->willReturnCallback(function (): bool {
-                            return true;
-                        });
+                        ->willReturn(static::createTestRecord('publicKeyCredentialId'));
                 },
                 function (SessionStore $store) use ($testSource) {
                     $repo = new CredentialRepository((string) $store->getMember()->ID);
-                    // phpcs:disable
-                    $repo->saveCredentialSource(PublicKeyCredentialSource::createFromArray([
-                        'publicKeyCredentialId' => 'cHVibGljS2V5Q3JlZGVudGlhbElk',
-                        'type' => 'public-key',
-                        'transports' =>
-                            array (
-                            ),
-                        'attestationType' => 'none',
-                        'trustPath' =>
-                            array (
-                                'type' => EmptyTrustPath::class,
-                            ),
-                        'aaguid' => 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA',
-                        'credentialPublicKey' => 'cHVibGljS2V5',
-                        'userHandle' => 'dXNlckhhbmRsZQ',
-                        'counter' => 123456789,
-                    ]));
-                    // phpcs:enable
+                    // The member's existing key: a different credential than the one being registered. webauthn-lib 4
+                    // refused a credential ID already in the repository inside its validator (mocked here); with
+                    // webauthn-lib 5 register() does that check itself (see the next case)
+                    $repo->saveCredentialSource(static::createTestRecord('existingCredentialId'));
+                    $store->addState(['repository' => $repo]);
+                },
+            ],
+            'response for an already registered credential' => [
+                $responseMock,
+                new Result(false, 'The credential ID is already registered'),
+                0,
+                function (MockObject $responseValidatorMock) {
+                    $responseValidatorMock
+                        ->expects($this->once())
+                        ->method('check')
+                        ->willReturn(static::createTestRecord('publicKeyCredentialId'));
+                },
+                function (SessionStore $store) {
+                    $repo = new CredentialRepository((string) $store->getMember()->ID);
+                    $repo->saveCredentialSource(static::createTestRecord('publicKeyCredentialId'));
                     $store->addState(['repository' => $repo]);
                 },
             ],
@@ -343,5 +323,25 @@ class RegisterHandlerTest extends SapphireTest
                 },
             ],
         ];
+    }
+
+    /**
+     * The credential these tests used with webauthn-lib 4, built with PublicKeyCredentialSource::createFromArray()
+     * (removed in webauthn-lib 5) from the base64 of these same values. PublicKeyCredentialSource is deprecated in
+     * webauthn-lib 5.3, so this is a CredentialRecord.
+     */
+    protected static function createTestRecord(string $credentialId): CredentialRecord
+    {
+        return CredentialRecord::create(
+            $credentialId,
+            'public-key',
+            [],
+            'none',
+            EmptyTrustPath::create(),
+            Uuid::fromString('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'),
+            'publicKey',
+            'userHandle',
+            123456789
+        );
     }
 }

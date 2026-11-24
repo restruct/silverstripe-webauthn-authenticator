@@ -59,8 +59,10 @@ class StoredCredentialTest extends SapphireTest
         $key = new SoftwareAuthenticator();
         $data = $this->register($member, $key, $format);
 
-        $this->assertTrue($this->verify($member, $data, $key)->isSuccessful(), 'First login');
-        $this->assertTrue($this->verify($member, $data, $key)->isSuccessful(), 'Second login, higher counter');
+        $result = $this->verify($member, $data, $key);
+        $this->assertTrue($result->isSuccessful(), 'First login: ' . $result->getMessage());
+        $result = $this->verify($member, $data, $key);
+        $this->assertTrue($result->isSuccessful(), 'Second login, higher counter: ' . $result->getMessage());
     }
 
     /**
@@ -97,7 +99,8 @@ class StoredCredentialTest extends SapphireTest
             (int) $fixture['signCount']
         );
 
-        $this->assertTrue($this->verify($member, $fixture['data'], $key)->isSuccessful());
+        $result = $this->verify($member, $fixture['data'], $key);
+        $this->assertTrue($result->isSuccessful(), $result->getMessage());
     }
 
     /**
