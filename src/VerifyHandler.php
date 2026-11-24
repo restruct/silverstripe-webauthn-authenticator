@@ -9,18 +9,18 @@ use Cose\Algorithm\Manager;
 use Exception;
 use GuzzleHttp\Psr7\ServerRequest;
 use Psr\Log\LoggerInterface;
+use Symfony\Component\Serializer\Normalizer\AbstractObjectNormalizer;
 use SilverStripe\Control\HTTPRequest;
 use SilverStripe\MFA\Exception\AuthenticationFailedException;
 use SilverStripe\MFA\Method\Handler\VerifyHandlerInterface;
 use SilverStripe\MFA\Model\RegisteredMethod;
 use SilverStripe\MFA\State\Result;
 use SilverStripe\MFA\Store\StoreInterface;
-use Webauthn\AuthenticationExtensions\ExtensionOutputCheckerHandler;
 use Webauthn\AuthenticatorAssertionResponse;
 use Webauthn\AuthenticatorAssertionResponseValidator;
+use Webauthn\CredentialRecord;
+use Webauthn\PublicKeyCredential;
 use Webauthn\PublicKeyCredentialRequestOptions;
-use Webauthn\PublicKeyCredentialSource;
-use Webauthn\TokenBinding\TokenBindingNotSupportedHandler;
 use Cose\Algorithm\Signature\ECDSA\ES256;
 use Error;
 
@@ -67,7 +67,14 @@ class VerifyHandler implements VerifyHandlerInterface
     public function start(StoreInterface $store, RegisteredMethod $method): array
     {
         return [
-            'publicKey' => $this->getCredentialRequestOptions($store, $method, true),
+            # webauthn-lib 5 options are not JsonSerializable; normalise them to the JSON the browser expects,
+            # without null members (they would reach navigator.credentials as the string "null")
+            'publicKey' => $this->getSerializer($this->getAttestationStatementSupportManager())
+                ->normalize(
+                    $this->getCredentialRequestOptions($store, $method, true),
+                    'json',
+                    [AbstractObjectNormalizer::SKIP_NULL_VALUES => true]
+                ),
         ];
     }
 
@@ -91,12 +98,12 @@ class VerifyHandler implements VerifyHandlerInterface
             $data = $this->makeAuthenticatorDataBase64UrlSafe($data);
 
             $attestationStatementSupportManager = $this->getAttestationStatementSupportManager();
-            $attestationObjectLoader = $this->getAttestationObjectLoader($attestationStatementSupportManager);
-            $publicKeyCredential = $this
-                ->getPublicKeyCredentialLoader($attestationObjectLoader)
-                ->load(base64_decode($data['credentials'] ?? ''));
-
-            $response = $publicKeyCredential->getResponse();
+            $publicKeyCredential = $this->getSerializer($attestationStatementSupportManager)->deserialize(
+                base64_decode($data['credentials'] ?? ''),
+                PublicKeyCredential::class,
+                'json'
+            );
+            $response = $publicKeyCredential->response;
             if (!$response instanceof AuthenticatorAssertionResponse) {
                 throw new ResponseTypeException('Unexpected response type found');
             }
@@ -104,14 +111,23 @@ class VerifyHandler implements VerifyHandlerInterface
             // Create a PSR-7 request
             $psrRequest = ServerRequest::fromGlobals();
 
-            $this->getAuthenticatorAssertionResponseValidator($store)
+            # webauthn-lib 5 takes the stored credential itself rather than its ID plus a repository
+            $credentialRepository = $this->getCredentialRepository($store, $registeredMethod);
+            $credentialRecord = $credentialRepository->findOneByCredentialId($publicKeyCredential->rawId);
+            if (!$credentialRecord) {
+                throw new ResponseDataException('Unknown credential');
+            }
+
+            $updatedRecord = $this->getAuthenticatorAssertionResponseValidator($store)
                 ->check(
-                    $publicKeyCredential->getRawId(),
+                    $credentialRecord,
                     $response,
                     $this->getCredentialRequestOptions($store, $registeredMethod),
-                    $psrRequest,
+                    $psrRequest->getUri()->getHost(),
                     (string) $store->getMember()->ID
                 );
+            # webauthn-lib 4 saved the updated signature counter to the repository itself; webauthn-lib 5 returns it
+            $credentialRepository->saveCredentialSource($updatedRecord);
         } catch (Exception $e) {
             $this->logger->error($e->getMessage());
             return Result::create(false, 'Verification failed: ' . $e->getMessage());
@@ -122,6 +138,10 @@ class VerifyHandler implements VerifyHandlerInterface
 
     /**
      * Make authenticatorData Base64urlSafe which is expected by PublicKeyCredentialLoader::createResponse()
+     *
+     * webauthn-lib 5 (AuthenticatorAssertionResponseDenormalizer) also requires base64url for signature, userHandle
+     * and clientDataJSON, while the client (client/src/lib/convert.js byteArrayToBase64()) sends standard base64.
+     * The conversion is lossless, so those fields are converted as well.
      */
     private function makeAuthenticatorDataBase64UrlSafe(array $data): array
     {
@@ -137,6 +157,15 @@ class VerifyHandler implements VerifyHandlerInterface
                 ['-', '_', ''],
                 $jsonCredientials['response']['authenticatorData']
             );
+            foreach (['signature', 'userHandle', 'clientDataJSON'] as $field) {
+                if (isset($jsonCredientials['response'][$field]) && is_string($jsonCredientials['response'][$field])) {
+                    $jsonCredientials['response'][$field] = str_replace(
+                        ['+', '/', '='],
+                        ['-', '_', ''],
+                        $jsonCredientials['response'][$field]
+                    );
+                }
+            }
             $decodedCredentials = json_encode($jsonCredientials, JSON_UNESCAPED_SLASHES);
             $data['credentials'] = base64_encode($decodedCredentials);
             return $data;
@@ -186,15 +215,17 @@ class VerifyHandler implements VerifyHandlerInterface
             throw new AuthenticationFailedException('User does not appear to have any credentials loaded for webauthn');
         }
 
-        $descriptors = array_map(function (PublicKeyCredentialSource $source) {
+        $descriptors = array_map(function (CredentialRecord $source) {
             return $source->getPublicKeyCredentialDescriptor();
         }, $validCredentials ?? []);
 
-        $options = new PublicKeyCredentialRequestOptions((string) random_bytes(32));
-        $options->setTimeout(40000);
-
-        $options->allowCredentials(...$descriptors);
-        $options->setUserVerification(PublicKeyCredentialRequestOptions::USER_VERIFICATION_REQUIREMENT_PREFERRED);
+        # webauthn-lib 5 options are immutable: everything the setters of webauthn-lib 4 set goes into create()
+        $options = PublicKeyCredentialRequestOptions::create(
+            (string) random_bytes(32),
+            allowCredentials: array_values($descriptors),
+            userVerification: PublicKeyCredentialRequestOptions::USER_VERIFICATION_REQUIREMENT_PREFERRED,
+            timeout: 40000
+        );
 
         // Persist the options for later
         $store->addState(['credentialOptions' => $options]);
@@ -209,13 +240,10 @@ class VerifyHandler implements VerifyHandlerInterface
     protected function getAuthenticatorAssertionResponseValidator(
         StoreInterface $store
     ): AuthenticatorAssertionResponseValidator {
-        $manager = new Manager();
-        $manager->add(new ES256());
-        return new AuthenticatorAssertionResponseValidator(
-            $this->getCredentialRepository($store),
-            new TokenBindingNotSupportedHandler(),
-            new ExtensionOutputCheckerHandler(),
-            $manager
-        );
+        # ES256 only, as with webauthn-lib 4 (registration offers ES256 only); webauthn-lib 5 would also allow RS256
+        $manager = Manager::create()->add(ES256::create());
+        $factory = $this->getCeremonyStepManagerFactory($this->getAttestationStatementSupportManager());
+        $factory->setAlgorithmManager($manager);
+        return AuthenticatorAssertionResponseValidator::create($factory->requestCeremony());
     }
 }
