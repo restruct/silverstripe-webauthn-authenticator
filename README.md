@@ -68,4 +68,4 @@ Installation, configuration and usage are as upstream: see the [upstream README]
 
 ## License
 
-BSD-3-Clause, as upstream. See [LICENSE.md](LICENSE.md).
+BSD-3-Clause, as upstream. See [LICENSE](LICENSE).
